@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+/* Editable table cells */
+.cell-editable {
+  cursor: text;
+  min-width: 40px;
+  min-height: 24px;
+  padding: 2px 4px;
+  border-radius: 2px;
+  transition: background-color 0.15s ease;
+}
+
+.cell-editable:hover {
+  background-color: rgba(59, 130, 246, 0.1);
+}
+
+.cell-editable:focus {
+  outline: 2px solid #3b82f6;
+  outline-offset: -1px;
+  background-color: white;
+}
+
+/* Flagged cell highlighting */
+.cell-flagged {
+  background-color: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.cell-flagged:hover {
+  background-color: rgba(245, 158, 11, 0.25);
+  cursor: pointer;
+}
+
+/* Scrollable table container */
+.table-container {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
