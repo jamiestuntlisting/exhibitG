@@ -208,3 +208,39 @@ export async function getEngineReadings(
 export function getExportCsvUrl(exhibitId: number): string {
   return `${BASE_URL}/${exhibitId}/export/csv`;
 }
+
+// ──────────────────────────────────────────────
+// Grid Correction Testing API
+// ──────────────────────────────────────────────
+
+export interface GridCorrectionStep {
+  step: number;
+  name: string;
+  description: string;
+  image_url: string;
+  data: Record<string, unknown>;
+}
+
+export interface GridCorrectionResult {
+  session_id: string;
+  filename: string;
+  steps: GridCorrectionStep[];
+  final_image_url: string | null;
+}
+
+export async function testGridCorrection(file: File): Promise<GridCorrectionResult> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch(`${BASE_URL}/test-grid-correction`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Grid correction failed" }));
+    throw new Error(error.detail || "Grid correction failed");
+  }
+
+  return response.json();
+}

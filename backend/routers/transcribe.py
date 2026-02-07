@@ -6,8 +6,12 @@ import os
 import io
 import csv
 import logging
+import uuid
+import tempfile
 from typing import Optional
 
+import cv2
+import numpy as np
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
@@ -16,6 +20,7 @@ from pydantic import BaseModel
 from database import get_db
 from models.exhibit_g import ExhibitG, ExhibitGRow, TranscriptionRun, CellDisagreement
 from services.pipeline import process_exhibit_g
+from services.claude_corrector import iterative_grid_correction
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +404,103 @@ def get_engine_readings(
         }
         for run in runs
     ]
+
+
+# ──────────────────────────────────────────────
+# Grid Correction Testing Endpoints
+# ──────────────────────────────────────────────
+
+# Store for grid correction sessions (in-memory for simplicity)
+_grid_correction_sessions: dict = {}
+
+
+@router.post("/test-grid-correction")
+async def test_grid_correction(file: UploadFile = File(...)):
+    """Test the iterative grid correction algorithm.
+
+    Runs the new grid-based correction and returns all intermediate steps
+    for debugging and visualization.
+    """
+    # Validate file type
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".heic", ".heif"}
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {ext}. Allowed: {', '.join(allowed_extensions)}"
+        )
+
+    # Read file content
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # Decode image
+    nparr = np.frombuffer(content, np.uint8)
+    image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Could not decode image")
+
+    # Generate session ID
+    session_id = str(uuid.uuid4())[:8]
+
+    # Create output directory for this session
+    output_dir = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "processed",
+        f"grid_correction_{session_id}"
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Run iterative grid correction
+    try:
+        corrected_image, steps = iterative_grid_correction(
+            image,
+            save_intermediates=True,
+            output_dir=output_dir
+        )
+    except Exception as e:
+        logger.error(f"Grid correction failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Grid correction failed: {str(e)}")
+
+    # Store session info
+    _grid_correction_sessions[session_id] = {
+        "output_dir": output_dir,
+        "steps": steps,
+        "filename": file.filename,
+    }
+
+    # Convert steps to API response format
+    response_steps = []
+    for step in steps:
+        response_steps.append({
+            "step": step["step"],
+            "name": step["name"],
+            "description": step["description"],
+            "image_url": f"/api/transcribe/grid-steps/{session_id}/{step['filename']}",
+            "data": step["data"],
+        })
+
+    return {
+        "session_id": session_id,
+        "filename": file.filename,
+        "steps": response_steps,
+        "final_image_url": f"/api/transcribe/grid-steps/{session_id}/{steps[-1]['filename']}" if steps else None,
+    }
+
+
+@router.get("/grid-steps/{session_id}/{filename}")
+def get_grid_step_image(session_id: str, filename: str):
+    """Serve an intermediate step image from the grid correction process."""
+    session = _grid_correction_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    filepath = os.path.join(session["output_dir"], filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(filepath, media_type="image/png")
 
 
 # ──────────────────────────────────────────────
