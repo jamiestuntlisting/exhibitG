@@ -906,17 +906,128 @@ def claude_correction_loop(image: np.ndarray, template_path: str,
 # ──────────────────────────────────────────────
 
 def _find_document_region(image: np.ndarray) -> Tuple[int, int, int, int]:
-    """Find the white paper region in the image.
+    """Find the grid table region in the Exhibit G form.
 
-    Returns (x, y, w, h) bounding box of the document area.
-    Uses brightness to find the white paper against darker background.
-    Adds substantial inward padding to exclude paper edges and focus on internal content.
+    Uses a multi-stage approach:
+    1. Try to find the grid by detecting where horizontal and vertical lines cluster
+    2. Fall back to template matching if line detection fails
+    3. Final fallback to brightness-based detection
+
+    Returns (x, y, w, h) bounding box of the grid table area.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    img_h, img_w = gray.shape[:2]
+
+    # Try line-density based detection first
+    grid_region = _find_grid_by_line_density(gray)
+    if grid_region is not None:
+        logger.info(f"Found grid region by line density: {grid_region}")
+        return grid_region
+
+    # Fall back to brightness-based detection
+    logger.info("Line density detection failed, falling back to brightness detection")
+    return _find_region_by_brightness(gray)
+
+
+def _find_grid_by_line_density(gray: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """Find the grid region by detecting where lines cluster most densely.
+
+    The Exhibit G grid has many closely-spaced horizontal and vertical lines.
+    This function finds the rectangular region where these lines concentrate.
+    """
+    img_h, img_w = gray.shape[:2]
+
+    # Use Canny edge detection
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Detect lines with relaxed thresholds
+    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi/180,
+                            threshold=80,
+                            minLineLength=int(min(img_w, img_h) * 0.05),
+                            maxLineGap=20)
+
+    if lines is None or len(lines) < 10:
+        return None
+
+    # Separate horizontal and vertical lines
+    h_lines = []
+    v_lines = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+
+        # Horizontal: angle near 0° or 180°
+        if abs(angle) < 20 or abs(abs(angle) - 180) < 20:
+            h_lines.append((y1 + y2) // 2)  # Y position
+        # Vertical: angle near 90° or -90°
+        elif abs(abs(angle) - 90) < 20:
+            v_lines.append((x1 + x2) // 2)  # X position
+
+    if len(h_lines) < 5 or len(v_lines) < 5:
+        return None
+
+    # Find the region with highest concentration of lines
+    # Create histograms of line positions
+    h_hist = np.zeros(img_h, dtype=int)
+    for y in h_lines:
+        if 0 <= y < img_h:
+            h_hist[max(0, y-10):min(img_h, y+10)] += 1
+
+    v_hist = np.zeros(img_w, dtype=int)
+    for x in v_lines:
+        if 0 <= x < img_w:
+            v_hist[max(0, x-10):min(img_w, x+10)] += 1
+
+    # Find contiguous regions with high line density
+    h_threshold = max(h_hist) * 0.3
+    v_threshold = max(v_hist) * 0.3
+
+    # Find Y bounds (horizontal lines)
+    h_mask = h_hist > h_threshold
+    h_indices = np.where(h_mask)[0]
+    if len(h_indices) < 2:
+        return None
+    y_min, y_max = h_indices[0], h_indices[-1]
+
+    # Find X bounds (vertical lines)
+    v_mask = v_hist > v_threshold
+    v_indices = np.where(v_mask)[0]
+    if len(v_indices) < 2:
+        return None
+    x_min, x_max = v_indices[0], v_indices[-1]
+
+    # Validate the region
+    region_w = x_max - x_min
+    region_h = y_max - y_min
+
+    # Grid should be reasonably sized (at least 20% of image in each dimension)
+    if region_w < img_w * 0.2 or region_h < img_h * 0.2:
+        return None
+
+    # Grid should be wider than tall (typical Exhibit G aspect ratio)
+    aspect_ratio = region_w / region_h if region_h > 0 else 0
+    if aspect_ratio < 1.0 or aspect_ratio > 5.0:
+        return None
+
+    # Add small margin
+    margin = 20
+    x_min = max(0, x_min - margin)
+    y_min = max(0, y_min - margin)
+    region_w = min(img_w - x_min, region_w + 2 * margin)
+    region_h = min(img_h - y_min, region_h + 2 * margin)
+
+    return (x_min, y_min, region_w, region_h)
+
+
+def _find_region_by_brightness(gray: np.ndarray) -> Tuple[int, int, int, int]:
+    """Fallback: Find the document region using brightness detection.
+
+    This is the original method - finds bright (white paper) regions.
+    """
     h, w = gray.shape[:2]
 
     # Find bright regions (white paper)
-    # Use a relatively high threshold since paper should be bright
     _, bright_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
 
     # Clean up with morphology
@@ -937,11 +1048,9 @@ def _find_document_region(image: np.ndarray) -> Tuple[int, int, int, int]:
     largest = max(contours, key=cv2.contourArea)
     x, y, rw, rh = cv2.boundingRect(largest)
 
-    # Add SUBSTANTIAL inward margin to exclude paper edges
-    # This is critical: we want to detect internal TABLE lines, not paper edges
-    # Use 5% of document size as margin to get well inside the paper
-    margin_x = int(rw * 0.05)
-    margin_y = int(rh * 0.05)
+    # Add inward margin to exclude paper edges
+    margin_x = int(rw * 0.10)  # Increased from 5% to 10%
+    margin_y = int(rh * 0.10)
 
     x = x + margin_x
     y = y + margin_y
@@ -1070,6 +1179,9 @@ def _detect_all_grid_lines(image: np.ndarray, orientation: str = 'horizontal',
     # Cluster nearby lines (same line detected multiple times)
     segments = _cluster_nearby_lines(segments, orientation, merge_threshold=20)
 
+    # Filter out lines that cross other lines (invalid for a parallel grid)
+    segments = _filter_crossing_lines(segments, orientation, img_w, img_h)
+
     # Sort by position
     segments.sort(key=lambda s: s['pos'])
 
@@ -1164,6 +1276,89 @@ def _merge_line_group(group: List[Dict]) -> Dict:
     }
 
 
+def _line_quality(seg: Dict, orientation: str) -> float:
+    """Score a line's quality. Higher = more likely a real grid line.
+
+    Factors:
+    - Length: longer lines are more likely real grid lines
+    - Angle deviation: lines closer to expected angle (0° for H, 90° for V) are better
+    """
+    length_score = seg['length']
+
+    if orientation == 'horizontal':
+        # For horizontal, angle should be near 0°
+        angle_score = 1000 - abs(seg['angle']) * 100
+    else:
+        # For vertical, angle should be near 90°
+        angle_score = 1000 - abs(seg['angle'] - 90) * 100
+
+    return length_score + angle_score
+
+
+def _filter_crossing_lines(segments: List[Dict], orientation: str,
+                           img_w: int, img_h: int) -> List[Dict]:
+    """Remove lines that intersect other lines of the same orientation.
+
+    For a valid grid, all horizontal lines should be parallel (never cross),
+    and all vertical lines should be parallel (never cross).
+
+    When two lines cross within the image bounds, we keep the higher-quality
+    line (longer, better angle) and discard the other.
+
+    Args:
+        segments: List of line segment dictionaries
+        orientation: 'horizontal' or 'vertical'
+        img_w: Image width
+        img_h: Image height
+
+    Returns:
+        Filtered list with crossing lines removed
+    """
+    if len(segments) < 2:
+        return segments
+
+    valid = []
+    removed_count = 0
+
+    for seg in segments:
+        is_valid = True
+        seg_line = [seg['x1'], seg['y1'], seg['x2'], seg['y2']]
+
+        to_remove = []
+        for other in valid:
+            other_line = [other['x1'], other['y1'], other['x2'], other['y2']]
+            intersection = _line_intersection(seg_line, other_line)
+
+            if intersection is not None:
+                ix, iy = intersection
+                # Check if intersection is within image bounds (with small margin)
+                margin = 50  # Allow small margin outside image
+                if -margin <= ix <= img_w + margin and -margin <= iy <= img_h + margin:
+                    # These "parallel" lines cross - keep the better one
+                    seg_quality = _line_quality(seg, orientation)
+                    other_quality = _line_quality(other, orientation)
+
+                    if seg_quality < other_quality:
+                        is_valid = False
+                        removed_count += 1
+                        break
+                    else:
+                        to_remove.append(other)
+                        removed_count += 1
+
+        # Remove lower-quality crossing lines
+        for item in to_remove:
+            valid.remove(item)
+
+        if is_valid:
+            valid.append(seg)
+
+    if removed_count > 0:
+        logger.info(f"Filtered {removed_count} crossing {orientation} lines")
+
+    return valid
+
+
 def _get_line_edge_intersections(seg: Dict, img_width: int, img_height: int,
                                   orientation: str) -> Tuple[float, float]:
     """Calculate where a fitted line intersects the image edges.
@@ -1245,21 +1440,17 @@ def iterative_grid_correction(
 ) -> Tuple[np.ndarray, List[Dict]]:
     """Apply iterative grid-based correction algorithm.
 
-    IMPROVED Algorithm using actual line intersection points:
+    NEW Algorithm - Alternating H/V correction with re-detection:
 
-    Phase 1 - Horizontal Correction (iterate up to 3x):
-    1. Detect all horizontal lines
-    2. Use topmost and bottommost lines to find trapezoid corners
-       (where lines intersect left and right image edges)
-    3. Apply perspective transform to make horizontal lines level
-    4. Re-measure, repeat if residual > 0.5°
+    Loop until converged (or max iterations):
+    1. Detect document/grid region
+    2. Detect horizontal lines, apply ONE correction pass
+    3. Re-detect document/grid region
+    4. Detect vertical lines, apply ONE correction pass
+    5. Check if changes are small enough to stop
 
-    Phase 2 - Vertical Correction (iterate up to 3x):
-    1. Detect all vertical lines
-    2. Use leftmost and rightmost lines to find trapezoid corners
-       (where lines intersect top and bottom image edges)
-    3. Apply perspective transform to make vertical lines plumb
-    4. Re-measure, repeat if residual > 0.5°
+    This approach re-detects the grid region after each correction,
+    ensuring we're always working with accurate bounds.
 
     Args:
         image: BGR numpy array
@@ -1280,6 +1471,20 @@ def iterative_grid_correction(
     current = image.copy()
     step_num = 0
 
+    def _convert_numpy(obj):
+        """Recursively convert numpy types to native Python types for JSON serialization."""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: _convert_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_convert_numpy(v) for v in obj]
+        return obj
+
     def save_step(img, name, description, data=None):
         nonlocal step_num
         step_num += 1
@@ -1292,7 +1497,7 @@ def iterative_grid_correction(
             'description': description,
             'filename': filename,
             'filepath': filepath,
-            'data': data or {}
+            'data': _convert_numpy(data) if data else {}
         }
         steps.append(step_info)
         logger.info(f"Step {step_num}: {description}")
@@ -1301,234 +1506,120 @@ def iterative_grid_correction(
     # ─── Step 0: Original image ───
     save_step(current, 'original', 'Original input image')
 
-    # ─── Find document region ───
-    doc_region = _find_document_region(current)
-    doc_x, doc_y, doc_w, doc_h = doc_region
-    logger.info(f"Document region: x={doc_x}, y={doc_y}, w={doc_w}, h={doc_h}")
-
-    # Visualize document region
-    vis_doc = current.copy()
-    cv2.rectangle(vis_doc, (doc_x, doc_y), (doc_x + doc_w, doc_y + doc_h), (0, 255, 0), 3)
-    save_step(vis_doc, 'doc_region',
-              f'Document region: ({doc_x}, {doc_y}) {doc_w}x{doc_h}',
-              {'x': doc_x, 'y': doc_y, 'w': doc_w, 'h': doc_h})
-
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1: HORIZONTAL CORRECTION (iterate until converged)
+    # MAIN LOOP: Rotation then keystone corrections
     # ═══════════════════════════════════════════════════════════════════
 
-    MAX_H_ITERATIONS = 3
-    for h_iter in range(MAX_H_ITERATIONS):
-        # Re-detect document region after each correction
+    MAX_ITERATIONS = 5
+    CONVERGENCE_THRESHOLD = 0.5  # Degrees
+    MIN_CORRECTION_PX = 5.0
+
+    for iteration in range(MAX_ITERATIONS):
+        logger.info(f"=== Iteration {iteration+1}/{MAX_ITERATIONS} ===")
+
+        # ─────────────────────────────────────────────────────────────
+        # STEP A: Detect document region and lines
+        # ─────────────────────────────────────────────────────────────
         doc_region = _find_document_region(current)
-        h_lines = _detect_all_grid_lines(current, 'horizontal', doc_region)
-        h_angles = [seg['angle'] for seg in h_lines]
-
-        if len(h_lines) < 2:
-            logger.warning(f"H iter {h_iter+1}: Only {len(h_lines)} lines detected, stopping")
-            save_step(current, f'h{h_iter+1}_detect',
-                      f'H iter {h_iter+1}: {len(h_lines)} lines (insufficient)',
-                      {'iter': h_iter+1, 'lines': len(h_lines)})
-            break
-
-        h_max_angle = float(max(abs(a) for a in h_angles))
-        h_avg_angle = float(np.median(h_angles))
-
-        # Visualize detected lines with edge intersection markers
-        vis = current.copy()
+        doc_x, doc_y, doc_w, doc_h = doc_region
         img_h, img_w = current.shape[:2]
-        for seg in h_lines:
-            left_y, right_y = _get_line_edge_intersections(seg, img_w, img_h, 'horizontal')
-            # Draw actual line from edge to edge
-            cv2.line(vis, (0, int(left_y)), (img_w, int(right_y)), (0, 255, 0), 2)
-            # Draw angle annotation
-            cv2.putText(vis, f"{seg['angle']:.2f}°", (seg['x1'] + 10, int(seg['pos']) - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
-        save_step(vis, f'h{h_iter+1}_detect',
-                  f'H iter {h_iter+1}: {len(h_lines)} lines, max={h_max_angle:.2f}°, median={h_avg_angle:.2f}°',
-                  {'iter': h_iter+1, 'lines': len(h_lines), 'max_angle': h_max_angle,
-                   'median_angle': h_avg_angle, 'angles': h_angles})
+        vis_doc = current.copy()
+        cv2.rectangle(vis_doc, (doc_x, doc_y), (doc_x + doc_w, doc_y + doc_h), (0, 255, 0), 3)
+        save_step(vis_doc, f'iter{iteration+1}_doc',
+                  f'Iter {iteration+1}: Doc region: ({doc_x}, {doc_y}) {doc_w}x{doc_h}',
+                  {'iteration': iteration+1, 'x': doc_x, 'y': doc_y, 'w': doc_w, 'h': doc_h})
 
-        # Check convergence
-        if h_max_angle < 0.5:
-            logger.info(f"H iter {h_iter+1}: Converged (max angle {h_max_angle:.2f}° < 0.5°)")
-            save_step(current, f'h{h_iter+1}_done',
-                      f'H correction converged: max angle {h_max_angle:.2f}° < 0.5°',
-                      {'converged': True, 'max_angle': h_max_angle})
-            break
-
-        # Get topmost and bottommost lines for trapezoid construction
-        top_line = h_lines[0]  # Sorted by Y position, so first is topmost
-        bot_line = h_lines[-1]  # Last is bottommost
-
-        # Calculate where these lines intersect the image edges
-        top_left_y, top_right_y = _get_line_edge_intersections(top_line, img_w, img_h, 'horizontal')
-        bot_left_y, bot_right_y = _get_line_edge_intersections(bot_line, img_w, img_h, 'horizontal')
-
-        # The 4 corners of the trapezoid defined by these lines
-        # TL = (0, top_left_y), TR = (w, top_right_y)
-        # BL = (0, bot_left_y), BR = (w, bot_right_y)
-
-        tl_y = float(np.clip(top_left_y, 0, img_h))
-        tr_y = float(np.clip(top_right_y, 0, img_h))
-        bl_y = float(np.clip(bot_left_y, 0, img_h))
-        br_y = float(np.clip(bot_right_y, 0, img_h))
-
-        # Visualize the trapezoid
-        vis2 = current.copy()
-        pts = np.array([[0, tl_y], [img_w, tr_y], [img_w, br_y], [0, bl_y]], dtype=np.int32)
-        cv2.polylines(vis2, [pts], True, (0, 0, 255), 3)
-        # Mark corners
-        for px, py in pts:
-            cv2.circle(vis2, (px, py), 8, (255, 0, 0), -1)
-
-        save_step(vis2, f'h{h_iter+1}_trapezoid',
-                  f'H trapezoid: TL_y={tl_y:.0f}, TR_y={tr_y:.0f}, BL_y={bl_y:.0f}, BR_y={br_y:.0f}',
-                  {'tl_y': tl_y, 'tr_y': tr_y, 'bl_y': bl_y, 'br_y': br_y})
-
-        # Apply perspective transform to make horizontal lines level
-        # Source: actual trapezoid corners
-        # Destination: rectangle where top edge is level and bottom edge is level
-
-        # For destination, use average Y for top and bottom
-        dst_top_y = (tl_y + tr_y) / 2
-        dst_bot_y = (bl_y + br_y) / 2
-
-        src = np.array([
-            [0, tl_y],          # TL
-            [img_w, tr_y],      # TR
-            [img_w, br_y],      # BR
-            [0, bl_y],          # BL
-        ], dtype=np.float32)
-
-        dst = np.array([
-            [0, dst_top_y],     # TL -> level top
-            [img_w, dst_top_y], # TR -> level top
-            [img_w, dst_bot_y], # BR -> level bottom
-            [0, dst_bot_y],     # BL -> level bottom
-        ], dtype=np.float32)
-
-        M = cv2.getPerspectiveTransform(src, dst)
-        current = cv2.warpPerspective(current, M, (img_w, img_h),
-                                      borderMode=cv2.BORDER_CONSTANT,
-                                      borderValue=(255, 255, 255))
-
-        # Calculate the correction magnitude
-        top_correction = abs(tl_y - tr_y)
-        bot_correction = abs(bl_y - br_y)
-
-        save_step(current, f'h{h_iter+1}_correct',
-                  f'H iter {h_iter+1}: Applied correction (top_diff={top_correction:.1f}px, bot_diff={bot_correction:.1f}px)',
-                  {'iter': h_iter+1, 'top_correction_px': top_correction, 'bot_correction_px': bot_correction})
-
-    # ═══════════════════════════════════════════════════════════════════
-    # PHASE 2: VERTICAL CORRECTION (iterate until converged)
-    # ═══════════════════════════════════════════════════════════════════
-
-    MAX_V_ITERATIONS = 3
-    for v_iter in range(MAX_V_ITERATIONS):
-        # Re-detect document region after each correction
-        doc_region = _find_document_region(current)
+        # Detect both H and V lines
+        h_lines = _detect_all_grid_lines(current, 'horizontal', doc_region)
         v_lines = _detect_all_grid_lines(current, 'vertical', doc_region)
-        # Lines are already filtered to near-vertical in _detect_all_grid_lines
 
-        if len(v_lines) < 2:
-            logger.warning(f"V iter {v_iter+1}: Only {len(v_lines)} lines detected, stopping")
-            save_step(current, f'v{v_iter+1}_detect',
-                      f'V iter {v_iter+1}: {len(v_lines)} lines (filtered from {len(v_lines_raw)}, insufficient)',
-                      {'iter': v_iter+1, 'lines': len(v_lines), 'raw_lines': len(v_lines_raw)})
-            break
+        h_angles = [seg['angle'] for seg in h_lines] if h_lines else [0]
+        v_deviations = [seg['angle'] - 90 for seg in v_lines] if v_lines else [0]
 
-        # Calculate deviations from vertical (90°)
-        # Angles are now normalized to be near 90° (not ±90°)
-        v_deviations = []
-        for seg in v_lines:
-            angle = seg['angle']
-            dev = angle - 90  # Simple subtraction now that angles are normalized
-            v_deviations.append(dev)
-
-        v_max_dev = float(max(abs(d) for d in v_deviations))
-        v_median_dev = float(np.median(v_deviations))
+        h_median = float(np.median(h_angles))
+        v_median = float(np.median(v_deviations))
+        h_max = float(max(abs(a) for a in h_angles)) if h_angles else 0
+        v_max = float(max(abs(d) for d in v_deviations)) if v_deviations else 0
 
         # Visualize detected lines
         vis = current.copy()
-        img_h, img_w = current.shape[:2]
-        for i, seg in enumerate(v_lines):
+        for seg in h_lines:
+            left_y, right_y = _get_line_edge_intersections(seg, img_w, img_h, 'horizontal')
+            cv2.line(vis, (0, int(left_y)), (img_w, int(right_y)), (0, 255, 0), 2)
+        for seg in v_lines:
             top_x, bot_x = _get_line_edge_intersections(seg, img_w, img_h, 'vertical')
-            cv2.line(vis, (int(top_x), 0), (int(bot_x), img_h), (0, 255, 0), 2)
-            if i < 15:
-                cv2.putText(vis, f"{v_deviations[i]:.2f}°", (int(seg['pos']) + 3, seg['y1'] + 15),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+            cv2.line(vis, (int(top_x), 0), (int(bot_x), img_h), (0, 128, 255), 2)
 
-        save_step(vis, f'v{v_iter+1}_detect',
-                  f'V iter {v_iter+1}: {len(v_lines)} lines, max_dev={v_max_dev:.2f}°, median={v_median_dev:.2f}°',
-                  {'iter': v_iter+1, 'lines': len(v_lines), 'max_dev': v_max_dev,
-                   'median_dev': v_median_dev, 'deviations': v_deviations})
+        save_step(vis, f'iter{iteration+1}_detect',
+                  f'Iter {iteration+1}: H={len(h_lines)} lines ({h_median:.2f}°), V={len(v_lines)} lines ({v_median:.2f}° from vert)',
+                  {'h_lines': len(h_lines), 'v_lines': len(v_lines), 'h_median': h_median, 'v_median': v_median})
 
-        # Check convergence
-        if v_max_dev < 0.5:
-            logger.info(f"V iter {v_iter+1}: Converged (max dev {v_max_dev:.2f}° < 0.5°)")
-            save_step(current, f'v{v_iter+1}_done',
-                      f'V correction converged: max deviation {v_max_dev:.2f}° < 0.5°',
-                      {'converged': True, 'max_dev': v_max_dev})
-            break
+        total_correction_px = 0.0
 
-        # Get leftmost and rightmost lines for trapezoid construction
-        left_line = v_lines[0]   # Sorted by X position
-        right_line = v_lines[-1]
+        # ─────────────────────────────────────────────────────────────
+        # STEP B: ROTATION - Use H lines to determine skew
+        # ─────────────────────────────────────────────────────────────
+        # Horizontal lines give the best measure of rotation (tilt)
+        # because they span the full width of the document
 
-        # Calculate where these lines intersect the image edges
-        left_top_x, left_bot_x = _get_line_edge_intersections(left_line, img_w, img_h, 'vertical')
-        right_top_x, right_bot_x = _get_line_edge_intersections(right_line, img_w, img_h, 'vertical')
-
-        # Clip to image bounds
-        lt_x = float(np.clip(left_top_x, 0, img_w))
-        lb_x = float(np.clip(left_bot_x, 0, img_w))
-        rt_x = float(np.clip(right_top_x, 0, img_w))
-        rb_x = float(np.clip(right_bot_x, 0, img_w))
-
-        # Visualize the trapezoid
-        vis2 = current.copy()
-        pts = np.array([[lt_x, 0], [rt_x, 0], [rb_x, img_h], [lb_x, img_h]], dtype=np.int32)
-        cv2.polylines(vis2, [pts], True, (0, 0, 255), 3)
-        for px, py in pts:
-            cv2.circle(vis2, (px, py), 8, (255, 0, 0), -1)
-
-        save_step(vis2, f'v{v_iter+1}_trapezoid',
-                  f'V trapezoid: LT_x={lt_x:.0f}, LB_x={lb_x:.0f}, RT_x={rt_x:.0f}, RB_x={rb_x:.0f}',
-                  {'lt_x': lt_x, 'lb_x': lb_x, 'rt_x': rt_x, 'rb_x': rb_x})
-
-        # Apply perspective transform to make vertical lines plumb
-        # Destination: average X for left and right edges
-        dst_left_x = (lt_x + lb_x) / 2
-        dst_right_x = (rt_x + rb_x) / 2
-
-        src = np.array([
-            [lt_x, 0],          # TL
-            [rt_x, 0],          # TR
-            [rb_x, img_h],      # BR
-            [lb_x, img_h],      # BL
-        ], dtype=np.float32)
-
-        dst = np.array([
-            [dst_left_x, 0],     # TL -> plumb left
-            [dst_right_x, 0],    # TR -> plumb right
-            [dst_right_x, img_h],# BR -> plumb right
-            [dst_left_x, img_h], # BL -> plumb left
-        ], dtype=np.float32)
-
-        M = cv2.getPerspectiveTransform(src, dst)
-        current = cv2.warpPerspective(current, M, (img_w, img_h),
+        if len(h_lines) >= 2 and abs(h_median) >= CONVERGENCE_THRESHOLD:
+            # Rotate to level horizontal lines
+            # If line tilts down-right (+angle), rotate image CCW (+angle) to level it
+            # If line tilts up-right (-angle), rotate image CW (-angle) to level it
+            # So: rotation_angle = +h_median (same sign)
+            damping = 0.8
+            rotation_angle = h_median * damping
+            center = (img_w // 2, img_h // 2)
+            M_rot = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+            current = cv2.warpAffine(current, M_rot, (img_w, img_h),
                                       borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(255, 255, 255))
 
-        left_correction = abs(lt_x - lb_x)
-        right_correction = abs(rt_x - rb_x)
+            rotation_px = abs(math.tan(math.radians(rotation_angle)) * img_w / 2)
+            total_correction_px += rotation_px
 
-        save_step(current, f'v{v_iter+1}_correct',
-                  f'V iter {v_iter+1}: Applied correction (left_diff={left_correction:.1f}px, right_diff={right_correction:.1f}px)',
-                  {'iter': v_iter+1, 'left_correction_px': left_correction, 'right_correction_px': right_correction})
+            save_step(current, f'iter{iteration+1}_rotate',
+                      f'Iter {iteration+1}: H lines at {h_median:.2f}°, rotated by {rotation_angle:.2f}°',
+                      {'h_median': h_median, 'rotation': rotation_angle, 'rotation_px': rotation_px})
+
+            # Re-detect for keystone step
+            doc_region = _find_document_region(current)
+            h_lines = _detect_all_grid_lines(current, 'horizontal', doc_region)
+            v_lines = _detect_all_grid_lines(current, 'vertical', doc_region)
+
+        # ─────────────────────────────────────────────────────────────
+        # STEP C: HORIZONTAL KEYSTONE
+        # ─────────────────────────────────────────────────────────────
+        if len(h_lines) >= 2:
+            h_correction_px = 0.0
+            current, h_correction_px = _apply_horizontal_correction(current, h_lines, save_step, iteration, doc_region)
+            total_correction_px += h_correction_px
+
+        # ─────────────────────────────────────────────────────────────
+        # STEP D: VERTICAL KEYSTONE
+        # ─────────────────────────────────────────────────────────────
+        # Re-detect after H keystone
+        doc_region = _find_document_region(current)
+        v_lines = _detect_all_grid_lines(current, 'vertical', doc_region)
+
+        if len(v_lines) >= 2:
+            v_correction_px = 0.0
+            current, v_correction_px = _apply_vertical_correction(current, v_lines, save_step, iteration, doc_region)
+            total_correction_px += v_correction_px
+
+        # ─────────────────────────────────────────────────────────────
+        # STEP E: Check convergence
+        # ─────────────────────────────────────────────────────────────
+        logger.info(f"Iter {iteration+1}: H_max={h_max:.2f}°, V_max={v_max:.2f}°, Total_px={total_correction_px:.1f}")
+
+        if h_max < CONVERGENCE_THRESHOLD and v_max < CONVERGENCE_THRESHOLD:
+            logger.info(f"Converged after {iteration+1} iterations (both H and V below {CONVERGENCE_THRESHOLD}°)")
+            break
+
+        if total_correction_px < MIN_CORRECTION_PX:
+            logger.info(f"Converged after {iteration+1} iterations (corrections < {MIN_CORRECTION_PX}px)")
+            break
 
     # ─── Final step ───
     save_step(current, 'final', 'Final corrected image')
@@ -1536,3 +1627,213 @@ def iterative_grid_correction(
     logger.info(f"Iterative grid correction complete: {len(steps)} steps saved to {output_dir}")
 
     return current, steps
+
+
+def _apply_horizontal_correction(current: np.ndarray, h_lines: List[Dict],
+                                  save_step, iteration: int,
+                                  doc_region: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+    """Apply horizontal keystone correction (perspective).
+
+    Returns: (corrected_image, correction_magnitude_px)
+    """
+    img_h, img_w = current.shape[:2]
+
+    # Use 2nd line from top and 2nd from bottom (more reliable than edge lines)
+    if len(h_lines) >= 4:
+        top_line = h_lines[1]     # 2nd from top
+        bot_line = h_lines[-2]    # 2nd from bottom
+        logger.info(f"Iter {iteration+1} H: Using 2nd-from-edge lines for keystone")
+    else:
+        top_line = h_lines[0]
+        bot_line = h_lines[-1]
+        logger.info(f"Iter {iteration+1} H: Using edge lines for keystone (only {len(h_lines)} lines)")
+
+    # Calculate median angle for top half and bottom half
+    mid_y = (h_lines[0]['pos'] + h_lines[-1]['pos']) / 2
+    top_half = [s for s in h_lines if s['pos'] < mid_y]
+    bot_half = [s for s in h_lines if s['pos'] >= mid_y]
+
+    top_angles = [s['angle'] for s in top_half] if top_half else [0]
+    bot_angles = [s['angle'] for s in bot_half] if bot_half else [0]
+    top_median_angle = float(np.median(top_angles))
+    bot_median_angle = float(np.median(bot_angles))
+
+    logger.info(f"Iter {iteration+1} H: Top half median: {top_median_angle:.2f}°, Bot half median: {bot_median_angle:.2f}°")
+
+    # Calculate where reference lines intersect the image edges
+    top_left_y, top_right_y = _get_line_edge_intersections(top_line, img_w, img_h, 'horizontal')
+    bot_left_y, bot_right_y = _get_line_edge_intersections(bot_line, img_w, img_h, 'horizontal')
+
+    # Adjust intersections based on median angle if reference line differs
+    top_line_angle = top_line['angle']
+    bot_line_angle = bot_line['angle']
+
+    if abs(top_median_angle) > abs(top_line_angle):
+        adjustment = math.tan(math.radians(top_median_angle - top_line_angle)) * img_w
+        top_left_y -= adjustment / 2
+        top_right_y += adjustment / 2
+    if abs(bot_median_angle) > abs(bot_line_angle):
+        adjustment = math.tan(math.radians(bot_median_angle - bot_line_angle)) * img_w
+        bot_left_y -= adjustment / 2
+        bot_right_y += adjustment / 2
+
+    # Clip to image bounds
+    tl_y = float(np.clip(top_left_y, 0, img_h))
+    tr_y = float(np.clip(top_right_y, 0, img_h))
+    bl_y = float(np.clip(bot_left_y, 0, img_h))
+    br_y = float(np.clip(bot_right_y, 0, img_h))
+
+    # Check if keystone correction is needed
+    top_diff = abs(tl_y - tr_y)
+    bot_diff = abs(bl_y - br_y)
+
+    if top_diff < 5.0 and bot_diff < 5.0:
+        logger.info(f"Iter {iteration+1} H: Keystone negligible (top_diff={top_diff:.1f}px, bot_diff={bot_diff:.1f}px), skipping")
+        return current, 0.0
+
+    # Visualize the trapezoid
+    vis2 = current.copy()
+    pts = np.array([[0, tl_y], [img_w, tr_y], [img_w, br_y], [0, bl_y]], dtype=np.int32)
+    cv2.polylines(vis2, [pts], True, (0, 0, 255), 3)
+    for px, py in pts:
+        cv2.circle(vis2, (px, py), 8, (255, 0, 0), -1)
+
+    save_step(vis2, f'iter{iteration+1}_h_trapezoid',
+              f'Iter {iteration+1} H trapezoid: TL_y={tl_y:.0f}, TR_y={tr_y:.0f}, BL_y={bl_y:.0f}, BR_y={br_y:.0f}',
+              {'tl_y': tl_y, 'tr_y': tr_y, 'bl_y': bl_y, 'br_y': br_y})
+
+    # Apply perspective transform with damping
+    damping = 0.7
+    full_dst_top_y = (tl_y + tr_y) / 2
+    full_dst_bot_y = (bl_y + br_y) / 2
+
+    dst_tl_y = tl_y + (full_dst_top_y - tl_y) * damping
+    dst_tr_y = tr_y + (full_dst_top_y - tr_y) * damping
+    dst_bl_y = bl_y + (full_dst_bot_y - bl_y) * damping
+    dst_br_y = br_y + (full_dst_bot_y - br_y) * damping
+
+    src = np.array([
+        [0, tl_y], [img_w, tr_y], [img_w, br_y], [0, bl_y]
+    ], dtype=np.float32)
+
+    dst = np.array([
+        [0, dst_tl_y], [img_w, dst_tr_y], [img_w, dst_br_y], [0, dst_bl_y]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    corrected = cv2.warpPerspective(current, M, (img_w, img_h),
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=(255, 255, 255))
+
+    keystone_px = max(top_diff, bot_diff)
+
+    save_step(corrected, f'iter{iteration+1}_h_keystone',
+              f'Iter {iteration+1} H: Keystone correction (top_diff={top_diff:.1f}px, bot_diff={bot_diff:.1f}px)',
+              {'iteration': iteration+1, 'top_diff_px': top_diff, 'bot_diff_px': bot_diff})
+
+    return corrected, keystone_px
+
+
+def _apply_vertical_correction(current: np.ndarray, v_lines: List[Dict],
+                                save_step, iteration: int,
+                                doc_region: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+    """Apply vertical keystone correction (perspective).
+
+    Returns: (corrected_image, correction_magnitude_px)
+    """
+    img_h, img_w = current.shape[:2]
+
+    # Use 2nd line from left and 2nd from right (more reliable than edge lines)
+    if len(v_lines) >= 4:
+        left_line = v_lines[1]     # 2nd from left
+        right_line = v_lines[-2]   # 2nd from right
+        logger.info(f"Iter {iteration+1} V: Using 2nd-from-edge lines for keystone")
+    else:
+        left_line = v_lines[0]
+        right_line = v_lines[-1]
+        logger.info(f"Iter {iteration+1} V: Using edge lines for keystone (only {len(v_lines)} lines)")
+
+    # Calculate median deviation for left half and right half
+    mid_x = (v_lines[0]['pos'] + v_lines[-1]['pos']) / 2
+    left_half = [s for s in v_lines if s['pos'] < mid_x]
+    right_half = [s for s in v_lines if s['pos'] >= mid_x]
+
+    left_devs = [s['angle'] - 90 for s in left_half] if left_half else [0]
+    right_devs = [s['angle'] - 90 for s in right_half] if right_half else [0]
+    left_median_dev = float(np.median(left_devs))
+    right_median_dev = float(np.median(right_devs))
+
+    logger.info(f"Iter {iteration+1} V: Left half median: {left_median_dev:.2f}°, Right half median: {right_median_dev:.2f}°")
+
+    # Calculate where reference lines intersect the image edges
+    left_top_x, left_bot_x = _get_line_edge_intersections(left_line, img_w, img_h, 'vertical')
+    right_top_x, right_bot_x = _get_line_edge_intersections(right_line, img_w, img_h, 'vertical')
+
+    # Adjust intersections based on median deviation if reference line differs
+    left_line_dev = left_line['angle'] - 90
+    right_line_dev = right_line['angle'] - 90
+
+    if abs(left_median_dev) > abs(left_line_dev):
+        adjustment = math.tan(math.radians(left_median_dev - left_line_dev)) * img_h
+        left_top_x -= adjustment / 2
+        left_bot_x += adjustment / 2
+    if abs(right_median_dev) > abs(right_line_dev):
+        adjustment = math.tan(math.radians(right_median_dev - right_line_dev)) * img_h
+        right_top_x -= adjustment / 2
+        right_bot_x += adjustment / 2
+
+    # Clip to image bounds
+    lt_x = float(np.clip(left_top_x, 0, img_w))
+    lb_x = float(np.clip(left_bot_x, 0, img_w))
+    rt_x = float(np.clip(right_top_x, 0, img_w))
+    rb_x = float(np.clip(right_bot_x, 0, img_w))
+
+    # Check if keystone correction is needed
+    left_diff = abs(lt_x - lb_x)
+    right_diff = abs(rt_x - rb_x)
+
+    if left_diff < 5.0 and right_diff < 5.0:
+        logger.info(f"Iter {iteration+1} V: Keystone negligible (left_diff={left_diff:.1f}px, right_diff={right_diff:.1f}px), skipping")
+        return current, 0.0
+
+    # Visualize the trapezoid
+    vis2 = current.copy()
+    pts = np.array([[lt_x, 0], [rt_x, 0], [rb_x, img_h], [lb_x, img_h]], dtype=np.int32)
+    cv2.polylines(vis2, [pts], True, (0, 0, 255), 3)
+    for px, py in pts:
+        cv2.circle(vis2, (px, py), 8, (255, 0, 0), -1)
+
+    save_step(vis2, f'iter{iteration+1}_v_trapezoid',
+              f'Iter {iteration+1} V trapezoid: LT_x={lt_x:.0f}, LB_x={lb_x:.0f}, RT_x={rt_x:.0f}, RB_x={rb_x:.0f}',
+              {'lt_x': lt_x, 'lb_x': lb_x, 'rt_x': rt_x, 'rb_x': rb_x})
+
+    # Apply perspective transform with damping
+    damping = 0.7
+    full_dst_left_x = (lt_x + lb_x) / 2
+    full_dst_right_x = (rt_x + rb_x) / 2
+
+    dst_tl_x = lt_x + (full_dst_left_x - lt_x) * damping
+    dst_bl_x = lb_x + (full_dst_left_x - lb_x) * damping
+    dst_tr_x = rt_x + (full_dst_right_x - rt_x) * damping
+    dst_br_x = rb_x + (full_dst_right_x - rb_x) * damping
+
+    src = np.array([
+        [lt_x, 0], [rt_x, 0], [rb_x, img_h], [lb_x, img_h]
+    ], dtype=np.float32)
+
+    dst = np.array([
+        [dst_tl_x, 0], [dst_tr_x, 0], [dst_br_x, img_h], [dst_bl_x, img_h]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    corrected = cv2.warpPerspective(current, M, (img_w, img_h),
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=(255, 255, 255))
+
+    keystone_px = max(left_diff, right_diff)
+
+    save_step(corrected, f'iter{iteration+1}_v_keystone',
+              f'Iter {iteration+1} V: Keystone correction (left_diff={left_diff:.1f}px, right_diff={right_diff:.1f}px)',
+              {'iteration': iteration+1, 'left_diff_px': left_diff, 'right_diff_px': right_diff})
+
+    return corrected, keystone_px

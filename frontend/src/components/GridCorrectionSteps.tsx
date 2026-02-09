@@ -27,6 +27,7 @@ export default function GridCorrectionSteps({
 }: GridCorrectionStepsProps) {
   const [selectedStep, setSelectedStep] = useState<number>(0)
   const [expandedImage, setExpandedImage] = useState(false)
+  const [showGridOverlay, setShowGridOverlay] = useState(false)
 
   const currentStep = steps[selectedStep]
 
@@ -95,12 +96,57 @@ export default function GridCorrectionSteps({
                   expandedImage ? 'max-h-[800px]' : 'max-h-[500px]'
                 } object-contain bg-white`}
               />
-              <button
-                onClick={() => setExpandedImage(!expandedImage)}
-                className="absolute top-2 right-2 bg-white/90 hover:bg-white px-2 py-1 rounded text-xs text-gray-600 shadow"
-              >
-                {expandedImage ? 'Collapse' : 'Expand'}
-              </button>
+              {/* Grid overlay */}
+              {showGridOverlay && (
+                <svg
+                  className="absolute inset-0 w-full h-full pointer-events-none"
+                  viewBox="0 0 100 100"
+                  preserveAspectRatio="none"
+                >
+                  {/* Vertical lines (10 divisions = 11 lines) */}
+                  {[...Array(11)].map((_, i) => (
+                    <line
+                      key={`v-${i}`}
+                      x1={i * 10}
+                      y1={0}
+                      x2={i * 10}
+                      y2={100}
+                      stroke="rgba(255, 0, 0, 0.5)"
+                      strokeWidth="0.3"
+                    />
+                  ))}
+                  {/* Horizontal lines (10 divisions = 11 lines) */}
+                  {[...Array(11)].map((_, i) => (
+                    <line
+                      key={`h-${i}`}
+                      x1={0}
+                      y1={i * 10}
+                      x2={100}
+                      y2={i * 10}
+                      stroke="rgba(255, 0, 0, 0.5)"
+                      strokeWidth="0.3"
+                    />
+                  ))}
+                </svg>
+              )}
+              {/* Controls */}
+              <div className="absolute top-2 right-2 flex items-center gap-2">
+                <label className="flex items-center gap-1 bg-white/90 hover:bg-white px-2 py-1 rounded text-xs text-gray-600 shadow cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showGridOverlay}
+                    onChange={(e) => setShowGridOverlay(e.target.checked)}
+                    className="w-3 h-3"
+                  />
+                  Grid
+                </label>
+                <button
+                  onClick={() => setExpandedImage(!expandedImage)}
+                  className="bg-white/90 hover:bg-white px-2 py-1 rounded text-xs text-gray-600 shadow"
+                >
+                  {expandedImage ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
             </div>
           </div>
 
