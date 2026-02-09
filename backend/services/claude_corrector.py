@@ -1514,6 +1514,10 @@ def iterative_grid_correction(
     CONVERGENCE_THRESHOLD = 0.5  # Degrees
     MIN_CORRECTION_PX = 5.0
 
+    # Track all transformation matrices for single-pass high-quality output
+    # Each matrix is 3x3 homogeneous. We'll compose them at the end.
+    accumulated_transforms: List[np.ndarray] = []
+
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"=== Iteration {iteration+1}/{MAX_ITERATIONS} ===")
 
@@ -1576,6 +1580,10 @@ def iterative_grid_correction(
                                       borderMode=cv2.BORDER_CONSTANT,
                                       borderValue=(255, 255, 255))
 
+            # Convert 2x3 affine to 3x3 homogeneous and accumulate
+            M_rot_3x3 = np.vstack([M_rot, [0, 0, 1]])
+            accumulated_transforms.append(M_rot_3x3)
+
             rotation_px = abs(math.tan(math.radians(rotation_angle)) * img_w / 2)
             total_correction_px += rotation_px
 
@@ -1593,8 +1601,10 @@ def iterative_grid_correction(
         # ─────────────────────────────────────────────────────────────
         if len(h_lines) >= 2:
             h_correction_px = 0.0
-            current, h_correction_px = _apply_horizontal_correction(current, h_lines, save_step, iteration, doc_region)
+            current, h_correction_px, h_matrix = _apply_horizontal_correction(current, h_lines, save_step, iteration, doc_region)
             total_correction_px += h_correction_px
+            if h_matrix is not None:
+                accumulated_transforms.append(h_matrix)
 
         # ─────────────────────────────────────────────────────────────
         # STEP D: VERTICAL KEYSTONE
@@ -1605,8 +1615,10 @@ def iterative_grid_correction(
 
         if len(v_lines) >= 2:
             v_correction_px = 0.0
-            current, v_correction_px = _apply_vertical_correction(current, v_lines, save_step, iteration, doc_region)
+            current, v_correction_px, v_matrix = _apply_vertical_correction(current, v_lines, save_step, iteration, doc_region)
             total_correction_px += v_correction_px
+            if v_matrix is not None:
+                accumulated_transforms.append(v_matrix)
 
         # ─────────────────────────────────────────────────────────────
         # STEP E: Check convergence
@@ -1621,20 +1633,53 @@ def iterative_grid_correction(
             logger.info(f"Converged after {iteration+1} iterations (corrections < {MIN_CORRECTION_PX}px)")
             break
 
-    # ─── Final step ───
-    save_step(current, 'final', 'Final corrected image')
+    # ─── Final step: Iterative result (may have quality loss) ───
+    save_step(current, 'final_iterative', 'Final corrected image (iterative)')
 
-    logger.info(f"Iterative grid correction complete: {len(steps)} steps saved to {output_dir}")
+    # ═══════════════════════════════════════════════════════════════════
+    # HIGH-QUALITY SINGLE-PASS CORRECTION
+    # ═══════════════════════════════════════════════════════════════════
+    # Compose all accumulated transforms into a single matrix and apply
+    # once to the original image. This avoids cumulative interpolation artifacts.
 
-    return current, steps
+    if accumulated_transforms:
+        logger.info(f"Composing {len(accumulated_transforms)} transforms for single-pass correction")
+
+        # Start with identity matrix
+        M_combined = np.eye(3, dtype=np.float64)
+
+        # Multiply matrices in order (first transform applied first)
+        for M in accumulated_transforms:
+            M_combined = M @ M_combined
+
+        # Apply the combined transformation to the ORIGINAL image
+        high_quality = cv2.warpPerspective(
+            image,  # Use original, not 'current'
+            M_combined,
+            (img_w, img_h),
+            flags=cv2.INTER_LANCZOS4,  # Higher quality interpolation
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255)
+        )
+
+        save_step(high_quality, 'final', 'Final corrected image (single-pass, high quality)',
+                  {'num_transforms': len(accumulated_transforms)})
+
+        logger.info(f"Iterative grid correction complete: {len(steps)} steps saved to {output_dir}")
+        return high_quality, steps
+    else:
+        # No transforms were applied, just rename the iterative final
+        save_step(current, 'final', 'Final corrected image (no corrections needed)')
+        logger.info(f"Iterative grid correction complete: {len(steps)} steps saved to {output_dir}")
+        return current, steps
 
 
 def _apply_horizontal_correction(current: np.ndarray, h_lines: List[Dict],
                                   save_step, iteration: int,
-                                  doc_region: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+                                  doc_region: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float, Optional[np.ndarray]]:
     """Apply horizontal keystone correction (perspective).
 
-    Returns: (corrected_image, correction_magnitude_px)
+    Returns: (corrected_image, correction_magnitude_px, transform_matrix_3x3)
     """
     img_h, img_w = current.shape[:2]
 
@@ -1689,7 +1734,7 @@ def _apply_horizontal_correction(current: np.ndarray, h_lines: List[Dict],
 
     if top_diff < 5.0 and bot_diff < 5.0:
         logger.info(f"Iter {iteration+1} H: Keystone negligible (top_diff={top_diff:.1f}px, bot_diff={bot_diff:.1f}px), skipping")
-        return current, 0.0
+        return current, 0.0, None
 
     # Visualize the trapezoid
     vis2 = current.copy()
@@ -1731,15 +1776,15 @@ def _apply_horizontal_correction(current: np.ndarray, h_lines: List[Dict],
               f'Iter {iteration+1} H: Keystone correction (top_diff={top_diff:.1f}px, bot_diff={bot_diff:.1f}px)',
               {'iteration': iteration+1, 'top_diff_px': top_diff, 'bot_diff_px': bot_diff})
 
-    return corrected, keystone_px
+    return corrected, keystone_px, M.astype(np.float64)
 
 
 def _apply_vertical_correction(current: np.ndarray, v_lines: List[Dict],
                                 save_step, iteration: int,
-                                doc_region: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float]:
+                                doc_region: Tuple[int, int, int, int]) -> Tuple[np.ndarray, float, Optional[np.ndarray]]:
     """Apply vertical keystone correction (perspective).
 
-    Returns: (corrected_image, correction_magnitude_px)
+    Returns: (corrected_image, correction_magnitude_px, transform_matrix_3x3)
     """
     img_h, img_w = current.shape[:2]
 
@@ -1794,7 +1839,7 @@ def _apply_vertical_correction(current: np.ndarray, v_lines: List[Dict],
 
     if left_diff < 5.0 and right_diff < 5.0:
         logger.info(f"Iter {iteration+1} V: Keystone negligible (left_diff={left_diff:.1f}px, right_diff={right_diff:.1f}px), skipping")
-        return current, 0.0
+        return current, 0.0, None
 
     # Visualize the trapezoid
     vis2 = current.copy()
@@ -1836,4 +1881,4 @@ def _apply_vertical_correction(current: np.ndarray, v_lines: List[Dict],
               f'Iter {iteration+1} V: Keystone correction (left_diff={left_diff:.1f}px, right_diff={right_diff:.1f}px)',
               {'iteration': iteration+1, 'left_diff_px': left_diff, 'right_diff_px': right_diff})
 
-    return corrected, keystone_px
+    return corrected, keystone_px, M.astype(np.float64)
