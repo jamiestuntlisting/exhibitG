@@ -2,6 +2,13 @@ import os
 import sys
 import logging
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, skip
+
 # Configure logging so all modules output to console
 logging.basicConfig(
     level=logging.INFO,

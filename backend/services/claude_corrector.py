@@ -1433,6 +1433,106 @@ def _compute_keystone_corners_from_angles(
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
+def _detect_orientation(image: np.ndarray) -> int:
+    """Detect if the image needs a 90° multiple rotation.
+
+    Uses line detection to determine if the document is rotated by approximately
+    90°, 180°, or 270° from the expected orientation.
+
+    For an Exhibit G form, we expect:
+    - More horizontal lines than vertical (it's a wide table)
+    - Horizontal lines should be roughly horizontal (within ±45° of 0°)
+
+    Returns:
+        Rotation needed in degrees: 0, 90, 180, or 270
+    """
+    img_h, img_w = image.shape[:2]
+
+    # Convert to grayscale
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+
+    # Apply edge detection
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Detect lines using HoughLinesP
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
+                            minLineLength=min(img_w, img_h) // 8,
+                            maxLineGap=20)
+
+    if lines is None or len(lines) < 5:
+        logger.info("Orientation detection: Not enough lines found, assuming correct orientation")
+        return 0
+
+    # Calculate angles for all lines
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        # Get angle in degrees (-90 to 90)
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        angles.append(angle)
+
+    # Categorize lines by orientation
+    # Horizontal-ish: -45 to 45 degrees
+    # Vertical-ish: 45 to 90 or -90 to -45 degrees
+    horizontal_count = sum(1 for a in angles if -45 <= a <= 45)
+    vertical_count = sum(1 for a in angles if a > 45 or a < -45)
+
+    logger.info(f"Orientation detection: {horizontal_count} horizontal-ish, {vertical_count} vertical-ish lines")
+
+    # For Exhibit G forms (wide tables), we expect more horizontal lines
+    # If we see more vertical lines, the image is likely rotated 90°
+
+    # Calculate the median angle of "horizontal" lines
+    h_angles = [a for a in angles if -45 <= a <= 45]
+    v_angles = [a for a in angles if a > 45 or a < -45]
+
+    if len(h_angles) >= len(v_angles):
+        # More horizontal lines - check if they're actually horizontal
+        median_h = np.median(h_angles) if h_angles else 0
+
+        # If median is close to 0, orientation is correct
+        if abs(median_h) < 45:
+            logger.info(f"Orientation: Correct (median H angle: {median_h:.1f}°)")
+            return 0
+    else:
+        # More vertical lines than horizontal - image is likely rotated 90°
+        # Check median angle of vertical lines
+        # Normalize vertical angles to be relative to vertical (90°)
+        v_normalized = []
+        for a in v_angles:
+            if a > 45:
+                v_normalized.append(a - 90)  # e.g., 85° -> -5°
+            else:
+                v_normalized.append(a + 90)  # e.g., -85° -> 5°
+
+        median_v = np.median(v_normalized) if v_normalized else 0
+
+        # Determine rotation direction based on which way lines lean
+        # If what should be horizontal lines are near +90°, rotate 90° CCW
+        # If what should be horizontal lines are near -90°, rotate 90° CW
+
+        # Check the dominant "vertical" angle
+        raw_v_median = np.median(v_angles) if v_angles else 90
+
+        if raw_v_median > 0:
+            # Lines are near +90° (pointing up-right), need 90° CW rotation
+            logger.info(f"Orientation: Need 270° (90° CW) (vertical lines at ~{raw_v_median:.1f}°)")
+            return 270
+        else:
+            # Lines are near -90° (pointing down-right), need 90° CCW rotation
+            logger.info(f"Orientation: Need 90° CCW (vertical lines at ~{raw_v_median:.1f}°)")
+            return 90
+
+    # Check for 180° rotation - this is harder to detect without text analysis
+    # For now, we'll skip 180° detection as it requires OCR or other methods
+    # The form should still work even if upside down (lines will still align)
+
+    return 0
+
+
 def iterative_grid_correction(
     image: np.ndarray,
     save_intermediates: bool = True,
@@ -1507,16 +1607,104 @@ def iterative_grid_correction(
     save_step(current, 'original', 'Original input image')
 
     # ═══════════════════════════════════════════════════════════════════
+    # ORIENTATION DETECTION: Multi-faceted analysis
+    # ═══════════════════════════════════════════════════════════════════
+
+    from services.orientation_detector import analyze_orientation, apply_orientation_correction, Orientation
+
+    img_h, img_w = current.shape[:2]
+
+    # Run comprehensive orientation analysis
+    logger.info("Running multi-faceted orientation detection...")
+    orientation_analysis = analyze_orientation(current)
+
+    # Convert analysis to serializable format for the step data
+    orientation_data = {
+        "recommended_rotation": orientation_analysis.recommended_orientation.value,
+        "overall_confidence": orientation_analysis.overall_confidence,
+        "voting_breakdown": orientation_analysis.voting_breakdown,
+        "methods": []
+    }
+
+    for result in orientation_analysis.results:
+        method_data = {
+            "method": result.method,
+            "orientation": result.orientation.value if result.orientation else None,
+            "confidence": result.confidence,
+            "error": result.error,
+            "details": _convert_numpy(result.details)
+        }
+        orientation_data["methods"].append(method_data)
+
+    # Save orientation analysis step
+    save_step(current, 'orientation_analysis',
+              f'Orientation analysis: {len(orientation_analysis.results)} methods, '
+              f'recommended {orientation_analysis.recommended_orientation.value}° '
+              f'(confidence: {orientation_analysis.overall_confidence:.2f})',
+              orientation_data)
+
+    orientation_rotation = orientation_analysis.recommended_orientation.value
+
+    # Track all transformation matrices for single-pass high-quality output
+    # Each matrix is 3x3 homogeneous. We'll compose them at the end.
+    accumulated_transforms: List[np.ndarray] = []
+
+    if orientation_rotation != 0:
+        logger.info(f"Detected orientation requires {orientation_rotation}° rotation")
+
+        # Apply 90° rotation(s) - these are lossless operations
+        if orientation_rotation == 90:
+            current = cv2.rotate(current, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif orientation_rotation == 180:
+            current = cv2.rotate(current, cv2.ROTATE_180)
+        elif orientation_rotation == 270:
+            current = cv2.rotate(current, cv2.ROTATE_90_CLOCKWISE)
+
+        # Update dimensions after rotation
+        img_h, img_w = current.shape[:2]
+
+        # Create the rotation matrix for accumulation
+        # For 90° multiples, we use special rotation matrices
+        center_x, center_y = img_w / 2, img_h / 2
+        if orientation_rotation == 90:
+            # 90° CCW: (x,y) -> (y, w-x) but dimensions swap
+            # We need to account for the dimension change
+            orig_h, orig_w = image.shape[:2]
+            M_orient = np.array([
+                [0, -1, orig_h],
+                [1, 0, 0],
+                [0, 0, 1]
+            ], dtype=np.float64)
+        elif orientation_rotation == 180:
+            orig_h, orig_w = image.shape[:2]
+            M_orient = np.array([
+                [-1, 0, orig_w],
+                [0, -1, orig_h],
+                [0, 0, 1]
+            ], dtype=np.float64)
+        elif orientation_rotation == 270:
+            orig_h, orig_w = image.shape[:2]
+            M_orient = np.array([
+                [0, 1, 0],
+                [-1, 0, orig_w],
+                [0, 0, 1]
+            ], dtype=np.float64)
+        else:
+            M_orient = np.eye(3, dtype=np.float64)
+
+        accumulated_transforms.append(M_orient)
+
+        save_step(current, 'orientation',
+                  f'Orientation correction: rotated {orientation_rotation}°',
+                  {'rotation_degrees': orientation_rotation})
+
+    # ═══════════════════════════════════════════════════════════════════
     # MAIN LOOP: Rotation then keystone corrections
     # ═══════════════════════════════════════════════════════════════════
 
     MAX_ITERATIONS = 5
     CONVERGENCE_THRESHOLD = 0.5  # Degrees
     MIN_CORRECTION_PX = 5.0
-
-    # Track all transformation matrices for single-pass high-quality output
-    # Each matrix is 3x3 homogeneous. We'll compose them at the end.
-    accumulated_transforms: List[np.ndarray] = []
 
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"=== Iteration {iteration+1}/{MAX_ITERATIONS} ===")
@@ -1645,22 +1833,57 @@ def iterative_grid_correction(
     if accumulated_transforms:
         logger.info(f"Composing {len(accumulated_transforms)} transforms for single-pass correction")
 
-        # Start with identity matrix
-        M_combined = np.eye(3, dtype=np.float64)
+        # Check if orientation rotation was applied (dimensions changed)
+        orig_h, orig_w = image.shape[:2]
+        final_h, final_w = current.shape[:2]
+        orientation_changed = (orig_w != final_w) or (orig_h != final_h)
 
-        # Multiply matrices in order (first transform applied first)
-        for M in accumulated_transforms:
-            M_combined = M @ M_combined
+        if orientation_changed and orientation_rotation in (90, 270):
+            # For 90° rotations, we can't easily compose with perspective transforms
+            # because the coordinate systems are different. Instead:
+            # 1. Apply orientation rotation to original (lossless)
+            # 2. Then apply remaining transforms
 
-        # Apply the combined transformation to the ORIGINAL image
-        high_quality = cv2.warpPerspective(
-            image,  # Use original, not 'current'
-            M_combined,
-            (img_w, img_h),
-            flags=cv2.INTER_LANCZOS4,  # Higher quality interpolation
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(255, 255, 255)
-        )
+            # First, rotate the original image
+            if orientation_rotation == 90:
+                rotated_original = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            elif orientation_rotation == 270:
+                rotated_original = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            else:
+                rotated_original = cv2.rotate(image, cv2.ROTATE_180)
+
+            # Compose only the non-orientation transforms (skip the first one)
+            if len(accumulated_transforms) > 1:
+                M_combined = np.eye(3, dtype=np.float64)
+                for M in accumulated_transforms[1:]:  # Skip orientation matrix
+                    M_combined = M @ M_combined
+
+                high_quality = cv2.warpPerspective(
+                    rotated_original,
+                    M_combined,
+                    (final_w, final_h),
+                    flags=cv2.INTER_LANCZOS4,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(255, 255, 255)
+                )
+            else:
+                # Only orientation was applied
+                high_quality = rotated_original
+        else:
+            # No orientation change, or 180° rotation (same dimensions)
+            # Compose all transforms
+            M_combined = np.eye(3, dtype=np.float64)
+            for M in accumulated_transforms:
+                M_combined = M @ M_combined
+
+            high_quality = cv2.warpPerspective(
+                image,
+                M_combined,
+                (final_w, final_h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(255, 255, 255)
+            )
 
         save_step(high_quality, 'final', 'Final corrected image (single-pass, high quality)',
                   {'num_transforms': len(accumulated_transforms)})

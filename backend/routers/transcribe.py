@@ -438,8 +438,28 @@ async def test_grid_correction(file: UploadFile = File(...)):
     # Decode image
     nparr = np.frombuffer(content, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    # If OpenCV couldn't decode (e.g., HEIC), try PIL
     if image is None:
-        raise HTTPException(status_code=400, detail="Could not decode image")
+        try:
+            from PIL import Image
+            import io as io_module
+
+            # Try pillow-heif for HEIC files
+            if ext in ('.heic', '.heif'):
+                try:
+                    from pillow_heif import register_heif_opener
+                    register_heif_opener()
+                except ImportError:
+                    pass
+
+            pil_img = Image.open(io_module.BytesIO(content))
+            if pil_img.mode != 'RGB':
+                pil_img = pil_img.convert('RGB')
+            image = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except Exception as pil_error:
+            logger.error(f"PIL decode also failed: {pil_error}")
+            raise HTTPException(status_code=400, detail=f"Could not decode image: {str(pil_error)}")
 
     # Generate session ID
     session_id = str(uuid.uuid4())[:8]

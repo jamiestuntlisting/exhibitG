@@ -4,6 +4,161 @@ interface StepData {
   [key: string]: unknown
 }
 
+interface OrientationMethod {
+  method: string
+  orientation: number | null
+  confidence: number
+  error: string | null
+  details: Record<string, unknown>
+}
+
+interface OrientationAnalysisData {
+  recommended_rotation: number
+  overall_confidence: number
+  voting_breakdown: Record<string, number>
+  methods: OrientationMethod[]
+}
+
+function isOrientationAnalysis(data: StepData): boolean {
+  return 'methods' in data && 'voting_breakdown' in data && 'recommended_rotation' in data
+}
+
+function OrientationAnalysisPanel({ data }: { data: OrientationAnalysisData }) {
+  const [expandedMethod, setExpandedMethod] = useState<string | null>(null)
+
+  const getConfidenceColor = (confidence: number) => {
+    if (confidence >= 0.7) return 'text-green-600 bg-green-100'
+    if (confidence >= 0.4) return 'text-yellow-600 bg-yellow-100'
+    return 'text-red-600 bg-red-100'
+  }
+
+  const getMethodIcon = (method: string) => {
+    switch (method) {
+      case 'ocr': return '📝'
+      case 'logo': return '🎯'
+      case 'template': return '📐'
+      case 'claude_vision': return '🤖'
+      case 'lines': return '📏'
+      default: return '❓'
+    }
+  }
+
+  const formatRotation = (rotation: number | null) => {
+    if (rotation === null) return 'Unknown'
+    if (rotation === 0) return 'Correct (0°)'
+    return `${rotation}° CCW`
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Overall Result */}
+      <div className="bg-blue-50 rounded-lg p-3 border border-blue-200">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-sm font-semibold text-blue-800">Recommended Rotation</span>
+          <span className={`px-2 py-0.5 rounded text-xs font-medium ${getConfidenceColor(data.overall_confidence)}`}>
+            {(data.overall_confidence * 100).toFixed(0)}% confident
+          </span>
+        </div>
+        <div className="text-2xl font-bold text-blue-900">
+          {formatRotation(data.recommended_rotation)}
+        </div>
+      </div>
+
+      {/* Voting Breakdown */}
+      <div>
+        <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+          Vote Distribution
+        </h5>
+        <div className="grid grid-cols-4 gap-1 text-center">
+          {Object.entries(data.voting_breakdown).map(([rotation, votes]) => (
+            <div
+              key={rotation}
+              className={`p-2 rounded text-xs ${
+                parseInt(rotation) === data.recommended_rotation
+                  ? 'bg-blue-100 border-2 border-blue-400'
+                  : 'bg-gray-100'
+              }`}
+            >
+              <div className="font-semibold">{rotation}°</div>
+              <div className="text-gray-600">{(votes as number).toFixed(2)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Individual Methods */}
+      <div>
+        <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+          Detection Methods
+        </h5>
+        <div className="space-y-2">
+          {data.methods.map((method) => (
+            <div
+              key={method.method}
+              className="border border-gray-200 rounded-lg overflow-hidden"
+            >
+              <button
+                onClick={() => setExpandedMethod(
+                  expandedMethod === method.method ? null : method.method
+                )}
+                className="w-full px-3 py-2 flex items-center justify-between bg-gray-50 hover:bg-gray-100 transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <span>{getMethodIcon(method.method)}</span>
+                  <span className="font-medium text-sm capitalize">
+                    {method.method.replace(/_/g, ' ')}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {method.error ? (
+                    <span className="text-xs text-red-500">Error</span>
+                  ) : method.orientation !== null ? (
+                    <>
+                      <span className="text-xs text-gray-600">
+                        {formatRotation(method.orientation)}
+                      </span>
+                      <span className={`px-1.5 py-0.5 rounded text-xs ${getConfidenceColor(method.confidence)}`}>
+                        {(method.confidence * 100).toFixed(0)}%
+                      </span>
+                    </>
+                  ) : (
+                    <span className="text-xs text-gray-400">No result</span>
+                  )}
+                  <span className="text-gray-400">
+                    {expandedMethod === method.method ? '▼' : '▶'}
+                  </span>
+                </div>
+              </button>
+
+              {expandedMethod === method.method && (
+                <div className="px-3 py-2 bg-white border-t border-gray-200 text-xs">
+                  {method.error && (
+                    <div className="text-red-600 mb-2">
+                      <strong>Error:</strong> {method.error}
+                    </div>
+                  )}
+                  <div className="space-y-1 max-h-48 overflow-y-auto">
+                    {Object.entries(method.details).map(([key, value]) => (
+                      <div key={key} className="flex justify-between">
+                        <span className="text-gray-500">{key}:</span>
+                        <span className="text-gray-800 font-mono ml-2 text-right max-w-[60%] truncate">
+                          {typeof value === 'object'
+                            ? JSON.stringify(value).slice(0, 50) + '...'
+                            : String(value).slice(0, 50)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 interface CorrectionStep {
   step: number
   name: string
@@ -162,22 +317,29 @@ export default function GridCorrectionSteps({
             {/* Step Data */}
             {Object.keys(currentStep.data).length > 0 && (
               <div>
-                <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-                  Measurements
-                </h5>
-                <div className="space-y-2">
-                  {Object.entries(currentStep.data).map(([key, value]) => (
-                    <div key={key} className="flex justify-between items-start text-sm">
-                      <span className="text-gray-500">{key.replace(/_/g, ' ')}:</span>
-                      <span className="text-gray-800 font-mono text-right ml-2">
-                        {formatDataValue(value)}
-                        {key.includes('angle') || key.includes('rotation') ||
-                         key.includes('keystone') || key.includes('avg') ||
-                         key.includes('std') || key.includes('dev') ? '°' : ''}
-                      </span>
+                {/* Special rendering for orientation analysis step */}
+                {currentStep.name === 'orientation_analysis' && isOrientationAnalysis(currentStep.data) ? (
+                  <OrientationAnalysisPanel data={currentStep.data as unknown as OrientationAnalysisData} />
+                ) : (
+                  <>
+                    <h5 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+                      Measurements
+                    </h5>
+                    <div className="space-y-2">
+                      {Object.entries(currentStep.data).map(([key, value]) => (
+                        <div key={key} className="flex justify-between items-start text-sm">
+                          <span className="text-gray-500">{key.replace(/_/g, ' ')}:</span>
+                          <span className="text-gray-800 font-mono text-right ml-2">
+                            {formatDataValue(value)}
+                            {key.includes('angle') || key.includes('rotation') ||
+                             key.includes('keystone') || key.includes('avg') ||
+                             key.includes('std') || key.includes('dev') ? '°' : ''}
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </>
+                )}
               </div>
             )}
 
